@@ -79,8 +79,18 @@ python tico-covers.py --roms "E:\tico\roms" --consoles snes,gba
 | `-ApiKey`         | `--api-key`    | API key (else `STEAMGRIDDB_API_KEY` env var)        |
 | `-CoversRoot`     | `--covers`     | Override where covers are written                   |
 | `-Consoles a,b`   | `--consoles a,b` | Limit to these console folders                    |
-| `-DelayMs`        | `--delay`      | Throttle between API calls (default 150 ms / 0.15 s) |
+| `-Workers N`      | `--workers N`  | Concurrent downloads (default 6)                    |
 | `-DryRun`         | `--dry-run`    | Show what would happen, download nothing            |
+
+## Speed / large libraries
+
+Covers are fetched concurrently (default **6 at a time**), so a few-thousand-ROM
+library finishes in minutes rather than tens of minutes. Games that already have a
+cover are filtered out *before* any network calls, so re-runs are near-instant.
+
+If you start seeing repeated `rate-limited/429` waits, lower the worker count
+(`-Workers 4` / `--workers 4`); if the API is happy, you can try raising it. The
+script backs off automatically on 429/5xx, so over-cranking mostly just self-limits.
 
 ## Re-running
 
