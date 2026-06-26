@@ -4,7 +4,7 @@ Auto-download SteamGridDB cover art for every game in your [tico](https://github
 ROM folders. Comes in two flavors with identical behavior:
 
 - `tico-covers.ps1` — PowerShell (nothing to install; works in Windows PowerShell 5.1 and 7+)
-- `tico-covers.py` — Python 3 (standard library only; nothing to `pip install`)
+- `tico-covers.py` — Python 3 (requires **Pillow**: `pip install Pillow`)
 
 ## What it does
 
@@ -12,9 +12,11 @@ For each console folder under your ROMs root, it:
 
 1. Reads every ROM file and turns the filename into a search term
    (stripping tags like `(USA)`, `[!]`, `(Rev 1)` and fixing `Zelda, The` → `The Zelda`).
-2. **Skips** any game that already has a cover.
-3. Searches SteamGridDB, takes the top game match, and grabs its best **portrait** cover.
-4. Saves it as `covers/<console>/<rom base name>.jpg` so tico matches it automatically.
+2. **Skips** any game that already has a `.jpg` cover.
+3. Searches SteamGridDB, takes the top game match, and grabs its best cover —
+   preferring **square** art, then portrait.
+4. Converts it to a **512×512 JPEG** (scale-to-fill + center-crop) and saves it as
+   `covers/<console>/<rom base name>.jpg`, the format tico displays.
 
 It prints a running log and an end summary, including a list of games it couldn't find
 covers for (fix those by hand in tico: hover the game → **+Select → Find Cover**).
@@ -61,6 +63,9 @@ If PowerShell blocks the script, run it for this session only:
 **Python**
 
 ```powershell
+# one-time: install Pillow (image conversion)
+pip install Pillow
+
 # preview first:
 python tico-covers.py --roms "E:\tico\roms" --dry-run
 
@@ -94,8 +99,10 @@ script backs off automatically on 429/5xx, so over-cranking mostly just self-lim
 
 ## Re-running
 
-Safe to run as often as you like — it **skips games that already have a cover**, so a
-second run only fills in the gaps (e.g. after you add more ROMs).
+Safe to run as often as you like — it **skips games that already have a `.jpg` cover**, so a
+second run only fills in the gaps (e.g. after you add more ROMs). Only a `.jpg` counts as
+"done", so if an older version of this script left invisible `.png` covers, just re-run:
+those games are redone as 512×512 JPEG and the stale `.png` is removed automatically.
 
 ## Known limitations (v1)
 

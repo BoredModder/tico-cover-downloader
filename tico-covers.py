@@ -27,11 +27,17 @@ import urllib.request
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+try:
+    from PIL import Image  # Pillow: pip install Pillow
+except ImportError:
+    Image = None
+
 API_BASE = "https://www.steamgriddb.com/api/v2"
-# Portrait/box-art dimensions, in order of preference.
+# Cover-art dimensions to request, by preference: square first (matches tico's 512x512
+# tile with no cropping), then portrait, then anything.
+SQUARE_DIMS = "512x512,1024x1024"
 PORTRAIT_DIMS = "600x900,342x482,660x930"
-# Image extensions tico-covers writes; used to detect an already-present cover.
-COVER_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+COVER_SIDE = 512  # tico displays 512x512 JPEG covers
 # Extensions that are NOT game ROMs (assets, saves, patches, metadata).
 SKIP_EXTS = {
     ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp",            # images
@@ -100,41 +106,48 @@ def search_game(term, api_key):
 
 
 def best_cover_url(game_id, api_key):
-    """Return the URL of the best portrait cover for a game id, or None."""
+    """Return (url, tag) of the best usable cover for a game id, or (None, None)."""
     base = f"{API_BASE}/grids/game/{game_id}"
-    queries = [
-        f"?types=static&nsfw=false&humor=false&dimensions={PORTRAIT_DIMS}",
-        "?types=static&nsfw=false&humor=false",  # fallback: any static grid, filtered below
-    ]
-    for q in queries:
+    for dims, tag in ((SQUARE_DIMS, "square"), (PORTRAIT_DIMS, "portrait"), (None, "any")):
+        q = "?types=static&nsfw=false&humor=false"
+        if dims:
+            q += f"&dimensions={dims}"
         data = http_get_json(base + q, api_key)
         if not data or not data.get("success"):
             continue
-        grids = [g for g in (data.get("data") or []) if g.get("url")]
-
-        def score(g):
-            portrait = 1 if (g.get("height", 0) >= g.get("width", 1)) else 0
-            jp = 1 if str(g.get("url", "")).lower().endswith((".jpg", ".jpeg", ".png")) else 0
-            return (portrait, jp, g.get("upvotes", 0))
-
+        # Only jpg/png, for parity with the PowerShell version and reliable decoding.
+        grids = [g for g in (data.get("data") or [])
+                 if str(g.get("url", "")).lower().endswith((".jpg", ".jpeg", ".png"))]
         if grids:
-            grids.sort(key=score, reverse=True)
-            return grids[0]["url"]
-    return None
+            grids.sort(key=lambda g: (g.get("upvotes", 0), g.get("width", 0)), reverse=True)
+            return grids[0]["url"], tag
+    return None, None
 
 
-def download(url, dest):
+def fetch_bytes(url):
     req = urllib.request.Request(url, headers={"User-Agent": "tico-covers/1.0"})
     with urllib.request.urlopen(req, timeout=60) as resp:
-        data = resp.read()
+        return resp.read()
+
+
+def save_square_jpeg(data, dest):
+    """Scale-to-fill + center-crop to a COVER_SIDE square, save as JPEG (no borders)."""
+    import io
+    im = Image.open(io.BytesIO(data)).convert("RGB")
+    w, h = im.size
+    scale = max(COVER_SIDE / w, COVER_SIDE / h)
+    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+    im = im.resize((nw, nh), Image.LANCZOS)
+    left, top = (nw - COVER_SIDE) // 2, (nh - COVER_SIDE) // 2
+    im = im.crop((left, top, left + COVER_SIDE, top + COVER_SIDE))
     tmp = dest + ".part"
-    with open(tmp, "wb") as f:
-        f.write(data)
+    im.save(tmp, "JPEG", quality=90)
     os.replace(tmp, dest)
 
 
 def existing_cover(covers_dir, stem):
-    for ext in COVER_EXTS:
+    # Only a .jpg counts as done, so a re-run replaces old invisible .png files.
+    for ext in (".jpg", ".jpeg"):
         if os.path.exists(os.path.join(covers_dir, stem + ext)):
             return True
     return False
@@ -200,20 +213,22 @@ def process_item(item, api_key, dry_run):
         if not game:
             return {"status": "miss", "console": console, "stem": stem,
                     "msg": f"no match for '{term}'"}
-        url = best_cover_url(game.get("id"), api_key)
+        url, tag = best_cover_url(game.get("id"), api_key)
         if not url:
             return {"status": "miss", "console": console, "stem": stem,
-                    "msg": f"game '{game.get('name')}' has no portrait cover"}
-        cover_ext = os.path.splitext(urllib.parse.urlparse(url).path)[1].lower()
-        if cover_ext not in COVER_EXTS:
-            cover_ext = ".jpg"
+                    "msg": f"game '{game.get('name')}' has no usable cover"}
         if dry_run:
             return {"status": "ok", "console": console, "stem": stem,
-                    "msg": f"would get <- '{game.get('name')}'  {url}"}
+                    "msg": f"would get ({tag}) <- '{game.get('name')}'  {url}"}
         os.makedirs(item["covers_dir"], exist_ok=True)
-        download(url, os.path.join(item["covers_dir"], stem + cover_ext))
+        dest = os.path.join(item["covers_dir"], stem + ".jpg")
+        save_square_jpeg(fetch_bytes(url), dest)
+        for stale_ext in (".png", ".webp"):  # remove old invisible covers tico ignores
+            stale = os.path.join(item["covers_dir"], stem + stale_ext)
+            if os.path.exists(stale):
+                os.remove(stale)
         return {"status": "ok", "console": console, "stem": stem,
-                "msg": f"<- '{game.get('name')}'"}
+                "msg": f"({tag}) <- '{game.get('name')}'"}
     except Exception as e:
         return {"status": "err", "console": console, "stem": stem, "msg": str(e)}
 
@@ -233,6 +248,9 @@ def main():
     if not args.api_key:
         raise SystemExit("ERROR: no API key. Pass --api-key or set STEAMGRIDDB_API_KEY.\n"
                          "Get one at https://www.steamgriddb.com/profile/preferences/api")
+    if Image is None:
+        raise SystemExit("ERROR: Pillow is required for image conversion.\n"
+                         "Install it with:  pip install Pillow")
     if not os.path.isdir(args.roms):
         raise SystemExit(f"ERROR: ROMs root not found: {args.roms}")
     workers = max(1, args.workers)

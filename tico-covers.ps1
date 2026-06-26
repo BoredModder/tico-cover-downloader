@@ -50,7 +50,6 @@ param(
 $ErrorActionPreference = 'Stop'
 $ApiBase       = 'https://www.steamgriddb.com/api/v2'
 $PortraitDims  = '600x900,342x482,660x930'
-$CoverExts     = @('.jpg', '.jpeg', '.png', '.webp')
 $SkipExts      = @('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp',
                    '.txt', '.nfo', '.dat', '.xml', '.json', '.jsonc', '.db',
                    '.sav', '.srm', '.state', '.st0', '.rtc',
@@ -73,7 +72,9 @@ function Get-CleanName([string] $stem) {
 }
 
 function Test-ExistingCover([string] $coversDir, [string] $stem) {
-    foreach ($ext in $CoverExts) {
+    # tico only displays .jpg, so only a .jpg counts as "already done" -- this lets a
+    # re-run replace the old, invisible .png files written by earlier versions.
+    foreach ($ext in @('.jpg', '.jpeg')) {
         if (Test-Path -LiteralPath (Join-Path $coversDir ($stem + $ext))) { return $true }
     }
     return $false
@@ -92,9 +93,13 @@ function Resolve-CoversRoot([string] $roms, [string] $override) {
 # --------------------------------------------------- worker (runs inside a runspace)
 
 $Worker = {
-    param($Item, $ApiKey, $ApiBase, $PortraitDims, $CoverExts, $DryRun)
+    param($Item, $ApiKey, $ApiBase, $PortraitDims, $DryRun)
     $ErrorActionPreference = 'Stop'
     [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+    Add-Type -AssemblyName System.Drawing
+    $JpegEncoder = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' }
+    $JpegParams  = New-Object System.Drawing.Imaging.EncoderParameters 1
+    $JpegParams.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter ([System.Drawing.Imaging.Encoder]::Quality, [int64]90)
 
     function Invoke-Sgdb($Url) {
         $headers = @{ Authorization = "Bearer $ApiKey"; 'User-Agent' = 'tico-covers/1.0' }
@@ -124,37 +129,58 @@ $Worker = {
         $game = @($data.data)[0]
         $res.Game = $game.name
 
-        $url = $null
-        foreach ($q in @("?types=static&nsfw=false&humor=false&dimensions=$PortraitDims",
-                         "?types=static&nsfw=false&humor=false")) {
-            $g = Invoke-Sgdb ("$ApiBase/grids/game/$($game.id)" + $q)
-            if (-not $g -or -not $g.success) { continue }
-            $grids = @($g.data | Where-Object { $_.url })
+        # Prefer SteamGridDB's SQUARE art (matches tico's 512x512 tile, no cropping),
+        # then portrait, then anything. Only jpg/png -- System.Drawing can't decode webp.
+        $url = $null; $picked = ''
+        foreach ($spec in @(
+                @{ q = "?types=static&nsfw=false&humor=false&dimensions=512x512,1024x1024"; tag = 'square' },
+                @{ q = "?types=static&nsfw=false&humor=false&dimensions=$PortraitDims";      tag = 'portrait' },
+                @{ q = "?types=static&nsfw=false&humor=false";                               tag = 'any' })) {
+            $gr = Invoke-Sgdb ("$ApiBase/grids/game/$($game.id)" + $spec.q)
+            if (-not $gr -or -not $gr.success) { continue }
+            $grids = @($gr.data | Where-Object { $_.url -and ($_.url -match '\.(jpg|jpeg|png)$') })
             if ($grids.Count -eq 0) { continue }
             $url = ($grids | Sort-Object -Property `
-                @{ Expression = { if ($_.height -ge $_.width) { 1 } else { 0 } }; Descending = $true }, `
-                @{ Expression = { if ($_.url -match '\.(jpg|jpeg|png)$') { 1 } else { 0 } }; Descending = $true }, `
-                @{ Expression = { [int]$_.upvotes }; Descending = $true })[0].url
+                @{ Expression = { [int]$_.upvotes }; Descending = $true }, `
+                @{ Expression = { [int]$_.width };   Descending = $true })[0].url
+            $picked = $spec.tag
             break
         }
-        if (-not $url) { $res.Status = 'miss'; $res.Msg = "game '$($game.name)' has no portrait cover"; return $res }
+        if (-not $url) { $res.Status = 'miss'; $res.Msg = "game '$($game.name)' has no usable cover"; return $res }
 
-        $coverExt = [System.IO.Path]::GetExtension(([uri]$url).AbsolutePath).ToLower()
-        if (-not ($CoverExts -contains $coverExt)) { $coverExt = '.jpg' }
-        $dest = Join-Path $Item.CoversDir ($Item.Stem + $coverExt)
-
-        if ($DryRun) { $res.Status = 'ok'; $res.Msg = "would get <- '$($game.name)'  $url"; return $res }
+        # tico displays covers as .jpg, so always write <rom name>.jpg.
+        $dest = Join-Path $Item.CoversDir ($Item.Stem + '.jpg')
+        if ($DryRun) { $res.Status = 'ok'; $res.Msg = "would get ($picked) <- '$($game.name)'  $url"; return $res }
         if (-not (Test-Path -LiteralPath $Item.CoversDir)) {
             New-Item -ItemType Directory -Force -Path $Item.CoversDir | Out-Null
         }
-        # WebClient takes a LITERAL filesystem path. Invoke-WebRequest -OutFile does
-        # not, and treats [ ] in names (e.g. the GoodTools "[!]" marker) as wildcards,
-        # which throws "Unable to find the specified file" before anything downloads.
+
+        # WebClient + System.Drawing/.NET I/O use LITERAL paths, so [ ] in names is safe.
         $wc = New-Object System.Net.WebClient
         $wc.Headers['User-Agent'] = 'tico-covers/1.0'
         try { $bytes = $wc.DownloadData($url) } finally { $wc.Dispose() }
-        [System.IO.File]::WriteAllBytes($dest, $bytes)
-        $res.Status = 'ok'; $res.Msg = "<- '$($game.name)'"
+
+        # Convert to a 512x512 JPEG: scale-to-fill + center-crop (no borders, no distortion).
+        $ms = New-Object System.IO.MemoryStream (,$bytes)
+        try {
+            $img = [System.Drawing.Image]::FromStream($ms)
+            $bmp = New-Object System.Drawing.Bitmap 512, 512
+            $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+            $gfx.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $scale = [Math]::Max((512 / $img.Width), (512 / $img.Height))
+            $dw = [int]($img.Width * $scale); $dh = [int]($img.Height * $scale)
+            $gfx.DrawImage($img, [int]((512 - $dw) * 0.5), [int]((512 - $dh) * 0.5), $dw, $dh)
+            $gfx.Dispose()
+            $bmp.Save($dest, $JpegEncoder, $JpegParams)
+            $bmp.Dispose(); $img.Dispose()
+        } finally { $ms.Dispose() }
+
+        # Drop stale non-jpg covers from earlier versions (tico ignores them).
+        foreach ($staleExt in @('.png', '.webp')) {
+            $stale = Join-Path $Item.CoversDir ($Item.Stem + $staleExt)
+            if ([System.IO.File]::Exists($stale)) { [System.IO.File]::Delete($stale) }
+        }
+        $res.Status = 'ok'; $res.Msg = "($picked) <- '$($game.name)'"
     } catch {
         $res.Status = 'err'; $res.Msg = $_.Exception.Message
     }
@@ -225,7 +251,7 @@ if ($work.Count -eq 0) {
         $ps.RunspacePool = $pool
         [void]$ps.AddScript($Worker).
             AddArgument($w).AddArgument($ApiKey).AddArgument($ApiBase).
-            AddArgument($PortraitDims).AddArgument($CoverExts).AddArgument([bool]$DryRun)
+            AddArgument($PortraitDims).AddArgument([bool]$DryRun)
         $tasks.Add([pscustomobject]@{ PS = $ps; Handle = $ps.BeginInvoke(); Done = $false })
     }
 
