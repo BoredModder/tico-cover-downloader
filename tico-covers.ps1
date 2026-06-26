@@ -94,6 +94,7 @@ function Resolve-CoversRoot([string] $roms, [string] $override) {
 $Worker = {
     param($Item, $ApiKey, $ApiBase, $PortraitDims, $CoverExts, $DryRun)
     $ErrorActionPreference = 'Stop'
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
 
     function Invoke-Sgdb($Url) {
         $headers = @{ Authorization = "Bearer $ApiKey"; 'User-Agent' = 'tico-covers/1.0' }
@@ -146,7 +147,13 @@ $Worker = {
         if (-not (Test-Path -LiteralPath $Item.CoversDir)) {
             New-Item -ItemType Directory -Force -Path $Item.CoversDir | Out-Null
         }
-        Invoke-WebRequest -Uri $url -OutFile $dest -TimeoutSec 60 -UseBasicParsing
+        # WebClient takes a LITERAL filesystem path. Invoke-WebRequest -OutFile does
+        # not, and treats [ ] in names (e.g. the GoodTools "[!]" marker) as wildcards,
+        # which throws "Unable to find the specified file" before anything downloads.
+        $wc = New-Object System.Net.WebClient
+        $wc.Headers['User-Agent'] = 'tico-covers/1.0'
+        try { $bytes = $wc.DownloadData($url) } finally { $wc.Dispose() }
+        [System.IO.File]::WriteAllBytes($dest, $bytes)
         $res.Status = 'ok'; $res.Msg = "<- '$($game.name)'"
     } catch {
         $res.Status = 'err'; $res.Msg = $_.Exception.Message
