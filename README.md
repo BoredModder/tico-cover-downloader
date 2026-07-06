@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="banner.png" alt="tico covers — auto-download SteamGridDB cover art for every game in your ROM library" width="620">
+</p>
+
 # tico-covers
 
 Auto-download SteamGridDB cover art for every game in your [tico](https://github.com/ticohq/tico)
@@ -20,6 +24,10 @@ For each console folder under your ROMs root, it:
 
 It prints a running log and an end summary, including a list of games it couldn't find
 covers for (fix those by hand in tico: hover the game → **+Select → Find Cover**).
+
+<p align="center">
+  <img src="example.png" alt="Example run: per-game log with square/portrait matches and an end summary of downloaded, skipped, and errored games" width="720">
+</p>
 
 ## 1. Get a SteamGridDB API key (free)
 
